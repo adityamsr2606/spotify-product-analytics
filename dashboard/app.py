@@ -3,64 +3,38 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.stats import ttest_ind
+
+from rapidfuzz import process, fuzz
+
 # -------------------------------
 # PAGE CONFIG
 # -------------------------------
-st.set_page_config(
-    page_title="Spotify Analytics",
-    page_icon="🎧",
-    layout="wide"
-)
+st.set_page_config(page_title="Spotify Analytics", page_icon="🎧", layout="wide")
 
 # -------------------------------
-# BACKGROUND + STYLING (Premium UI)
+# UI STYLE (Spotify feel)
 # -------------------------------
 st.markdown("""
 <style>
-.stApp {
-    background: url("https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4") no-repeat center center fixed;
-    background-size: cover;
-}
-
-/* Dark overlay */
-.stApp::before {
-    content: "";
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    background: rgba(0, 0, 0, 0.75);
-    z-index: -1;
-}
-
-/* Headings */
-h1, h2, h3 {
-    color: #1DB954;
-}
-
-/* KPI Cards */
-[data-testid="metric-container"] {
-    background-color: rgba(255,255,255,0.1);
-    padding: 12px;
-    border-radius: 12px;
-    backdrop-filter: blur(5px);
-}
+.stApp { background-color: #121212; color: white; }
+section[data-testid="stSidebar"] { background-color: #000; }
+button { background-color: #1DB954 !important; color: white !important; border-radius: 20px !important; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🎧 Spotify Product Analytics Dashboard")
-st.markdown("Analyze music engagement and performance patterns")
 
 # -------------------------------
 # LOAD DATA
 # -------------------------------
 @st.cache_data
 def load_data():
-    current_dir = os.path.dirname(__file__)
-    project_root = os.path.abspath(os.path.join(current_dir, ".."))
-    data_path = os.path.join(project_root, "data", "spotify", "tracks.csv")
-    return pd.read_csv(data_path)
+    path = os.path.join(os.path.dirname(__file__), "..", "data", "processed_spotify_small.csv")
+    return pd.read_csv(path)
 
 df = load_data()
 
@@ -76,13 +50,11 @@ df['engagement_score'] = (
     2 * df['duration_min']
 )
 
-# Normalize
 df['engagement_score'] = (
     (df['engagement_score'] - df['engagement_score'].min()) /
     (df['engagement_score'].max() - df['engagement_score'].min())
 )
 
-# Categorize
 df['engagement_level'] = pd.cut(
     df['engagement_score'],
     bins=[0, 0.3, 0.7, 1],
@@ -90,9 +62,66 @@ df['engagement_level'] = pd.cut(
 )
 
 # -------------------------------
-# SIDEBAR FILTERS
+# CLUSTERING
 # -------------------------------
-st.sidebar.header("🔍 Filters")
+features_cluster = df[['danceability','energy','valence','tempo']]
+scaled_cluster = StandardScaler().fit_transform(features_cluster)
+
+kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
+df['cluster'] = kmeans.fit_predict(scaled_cluster)
+
+cluster_map = {0:"Chill 😌",1:"Party 🎉",2:"Focus 🧘"}
+df['cluster_label'] = df['cluster'].map(cluster_map)
+
+# -------------------------------
+# RECOMMENDER
+# -------------------------------
+features_rec = df[['danceability','energy','valence','tempo','acousticness']]
+scaled_rec = StandardScaler().fit_transform(features_rec)
+scaled_df = pd.DataFrame(scaled_rec, index=df.index)
+
+def recommend_songs(song_name, top_n=5):
+    match = df[df['name'].str.lower() == song_name.lower()]
+    if match.empty:
+        return None
+
+    idx = match.index[0]
+    vec = scaled_df.loc[idx].values.reshape(1,-1)
+    sim = cosine_similarity(vec, scaled_df)[0]
+
+    indices = sim.argsort()[::-1][1:top_n+1]
+    return df[['name','artists','engagement_level']].iloc[indices]
+
+# -------------------------------
+# FUZZY SEARCH
+# -------------------------------
+def fuzzy_search(query, choices, limit=5):
+    results = process.extract(
+        query,
+        choices,
+        scorer=fuzz.token_sort_ratio,
+        limit=limit
+    )
+    return [r[0] for r in results if r[1] > 60]
+
+# -------------------------------
+# USER PERSONALIZATION
+# -------------------------------
+def build_user_profile(selected_songs):
+    user_data = df[df['name'].isin(selected_songs)]
+    if user_data.empty:
+        return None
+    return scaled_df.loc[user_data.index].mean().values.reshape(1,-1)
+
+def recommend_for_user(user_vector, top_n=5):
+    sim = cosine_similarity(user_vector, scaled_df)[0]
+    indices = sim.argsort()[::-1][:top_n]
+    return df[['name','artists','engagement_level']].iloc[indices]
+
+# -------------------------------
+# SIDEBAR
+# -------------------------------
+st.sidebar.header("Filters")
 
 levels = st.sidebar.multiselect(
     "Engagement Level",
@@ -100,132 +129,118 @@ levels = st.sidebar.multiselect(
     default=df['engagement_level'].dropna().unique()
 )
 
-pop_range = st.sidebar.slider(
-    "Popularity Range",
-    int(df['popularity'].min()),
-    int(df['popularity'].max()),
-    (20, 80)
+cluster_filter = st.sidebar.multiselect(
+    "Cluster",
+    df['cluster_label'].unique(),
+    default=df['cluster_label'].unique()
 )
 
-search_song = st.sidebar.text_input("🔎 Search Song")
-
 filtered_df = df[
-    (df['engagement_level'].isin(levels)) &
-    (df['popularity'].between(pop_range[0], pop_range[1]))
+    df['engagement_level'].isin(levels) &
+    df['cluster_label'].isin(cluster_filter)
 ]
 
-if search_song:
-    filtered_df = filtered_df[
-        filtered_df["name"].str.contains(search_song, case=False)
-    ]
-
 # -------------------------------
-# KPI SECTION
+# KPIs
 # -------------------------------
-st.subheader("📊 Key Metrics")
+st.subheader("📊 KPIs")
 
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric("Total Tracks", len(filtered_df))
-col2.metric("Avg Popularity", round(filtered_df['popularity'].mean(), 2))
-col3.metric("Avg Engagement", round(filtered_df['engagement_score'].mean(), 2))
-col4.metric("Avg Duration (min)", round(filtered_df['duration_min'].mean(), 2))
-
-# -------------------------------
-# HIGHLIGHT INSIGHT
-# -------------------------------
-st.subheader("🔥 Highlight")
-
-top_song = filtered_df.sort_values(
-    by="engagement_score", ascending=False
-).iloc[0]
-
-st.success(f"Top Performing Track: {top_song['name']}")
+c1,c2,c3 = st.columns(3)
+c1.metric("Tracks", len(filtered_df))
+c2.metric("Avg Engagement", round(filtered_df['engagement_score'].mean(),2))
+c3.metric("Avg Popularity", round(filtered_df['popularity'].mean(),2))
 
 # -------------------------------
 # VISUALS
 # -------------------------------
-st.subheader("📈 Engagement Insights")
+st.subheader("📈 Insights")
 
-col1, col2 = st.columns(2)
+col1,col2 = st.columns(2)
 
-# Histogram
 with col1:
-    fig1 = px.histogram(
-        filtered_df,
-        x="engagement_score",
-        nbins=40,
-        title="Engagement Score Distribution"
-    )
-    fig1.update_layout(template="plotly_dark")
-    st.plotly_chart(fig1, use_container_width=True)
+    st.plotly_chart(px.histogram(filtered_df, x="engagement_score", color="engagement_level"), use_container_width=True)
 
-# Scatter
 with col2:
-    fig2 = px.scatter(
-        filtered_df,
-        x="energy",
-        y="popularity",
-        color="engagement_level",
-        hover_data=["name", "danceability", "tempo"],
-        title="Energy vs Popularity"
-    )
-    fig2.update_layout(template="plotly_dark")
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(px.scatter(filtered_df, x="energy", y="popularity", color="engagement_level"), use_container_width=True)
 
 # -------------------------------
-# TOP TRACKS
+# CLUSTER VIEW
 # -------------------------------
-st.subheader("🎵 Top Tracks")
+st.subheader("🎯 Cluster Analysis")
 
-top_tracks = filtered_df.sort_values(
-    by="engagement_score", ascending=False
-).head(10)
-
-fig3 = px.bar(
-    top_tracks,
-    x="engagement_score",
-    y="name",
-    orientation="h",
-    color="engagement_score",
-    title="Top 10 Tracks by Engagement"
+st.plotly_chart(
+    px.scatter(filtered_df, x="danceability", y="energy", color="cluster_label"),
+    use_container_width=True
 )
 
-fig3.update_layout(template="plotly_dark", transition_duration=500)
-st.plotly_chart(fig3, use_container_width=True)
+# -------------------------------
+# A/B TEST
+# -------------------------------
+st.subheader("🧪 A/B Insight")
+
+high = df[df['energy'] > df['energy'].median()]
+low = df[df['energy'] <= df['energy'].median()]
+
+lift = ((high['engagement_score'].mean() - low['engagement_score'].mean()) / low['engagement_score'].mean())*100
+_, p = ttest_ind(high['engagement_score'], low['engagement_score'])
+
+st.write(f"Lift: {lift:.2f}%")
+st.write(f"P-value: {p:.5f}")
 
 # -------------------------------
-# DURATION ANALYSIS
+# FUZZY SEARCH UI
 # -------------------------------
-st.subheader("⏱️ Duration vs Engagement")
+st.subheader("🎧 Smart Song Search")
 
-fig4 = px.scatter(
-    filtered_df,
-    x="duration_min",
-    y="engagement_score",
-    color="engagement_level",
-    hover_data=["name"]
-)
+search_query = st.text_input("Type song name (supports typos)")
 
-fig4.update_layout(template="plotly_dark")
-st.plotly_chart(fig4, use_container_width=True)
+if search_query:
+    matches = fuzzy_search(search_query, df['name'].dropna().unique())
 
-# -------------------------------
-# INSIGHTS
-# -------------------------------
-st.subheader("🧠 Insights")
-
-if filtered_df['duration_min'].corr(filtered_df['engagement_score']) < 0:
-    st.write("• Shorter songs tend to perform better.")
-
-if filtered_df['danceability'].corr(filtered_df['engagement_score']) > 0:
-    st.write("• Danceable songs drive higher engagement.")
-
-if filtered_df['energy'].corr(filtered_df['engagement_score']) > 0:
-    st.write("• High-energy tracks are more engaging.")
+    if matches:
+        selected_song = st.selectbox("Did you mean:", matches)
+    else:
+        st.warning("No similar songs found")
+        selected_song = None
+else:
+    selected_song = None
 
 # -------------------------------
-# DATA PREVIEW
+# RECOMMENDATIONS
+# -------------------------------
+if selected_song:
+    st.markdown(f"### 🎵 Selected: {selected_song}")
+
+    results = recommend_songs(selected_song)
+
+    if results is not None:
+        cols = st.columns(2)
+        for i, (_, row) in enumerate(results.iterrows()):
+            with cols[i % 2]:
+                st.markdown(f"""
+                <div style="background-color:rgba(255,255,255,0.08);padding:12px;border-radius:10px;">
+                <b>{row['name']}</b><br>
+                👤 {row['artists']}<br>
+                🎯 {row['engagement_level']}
+                </div>
+                """, unsafe_allow_html=True)
+
+# -------------------------------
+# PERSONALIZATION
+# -------------------------------
+st.subheader("👤 Personalized Recommendations")
+
+user_songs = st.multiselect("Select songs you like", df['name'].dropna().sample(500))
+
+if st.button("Get Personalized Recommendations"):
+    vec = build_user_profile(user_songs)
+    if vec is not None:
+        st.dataframe(recommend_for_user(vec))
+    else:
+        st.warning("Select songs")
+
+# -------------------------------
+# DATA
 # -------------------------------
 st.subheader("📄 Data Preview")
 st.dataframe(filtered_df.head(50))
