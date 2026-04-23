@@ -1,4 +1,3 @@
-import os
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -16,7 +15,7 @@ from rapidfuzz import process, fuzz
 st.set_page_config(page_title="Spotify Analytics", page_icon="🎧", layout="wide")
 
 # -------------------------------
-# UI STYLE (Spotify feel)
+# UI STYLE
 # -------------------------------
 st.markdown("""
 <style>
@@ -29,12 +28,15 @@ button { background-color: #1DB954 !important; color: white !important; border-r
 st.title("🎧 Spotify Product Analytics Dashboard")
 
 # -------------------------------
-# LOAD DATA
+# LOAD DATA (FIXED)
 # -------------------------------
 @st.cache_data
 def load_data():
-    path = os.path.join(os.path.dirname(__file__), "..", "data", "processed_spotify_small.csv")
-    return pd.read_csv(path)
+    data_url = "https://drive.google.com/uc?id=1dssK34qFIjUguEozPywTE1Ta6sgGfSZZ"
+    df = pd.read_csv(data_url, low_memory=False)
+    df = df.dropna()
+    df = df.drop_duplicates()
+    return df
 
 df = load_data()
 
@@ -62,23 +64,32 @@ df['engagement_level'] = pd.cut(
 )
 
 # -------------------------------
-# CLUSTERING
+# CLUSTERING (CACHED)
 # -------------------------------
-features_cluster = df[['danceability','energy','valence','tempo']]
-scaled_cluster = StandardScaler().fit_transform(features_cluster)
+@st.cache_resource
+def compute_clusters(data):
+    features = data[['danceability','energy','valence','tempo']]
+    scaled = StandardScaler().fit_transform(features)
+    kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
+    clusters = kmeans.fit_predict(scaled)
+    return clusters, scaled
 
-kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
-df['cluster'] = kmeans.fit_predict(scaled_cluster)
+df['cluster'], scaled_cluster = compute_clusters(df)
 
 cluster_map = {0:"Chill 😌",1:"Party 🎉",2:"Focus 🧘"}
 df['cluster_label'] = df['cluster'].map(cluster_map)
 
 # -------------------------------
-# RECOMMENDER
+# RECOMMENDER (OPTIMIZED)
 # -------------------------------
-features_rec = df[['danceability','energy','valence','tempo','acousticness']]
-scaled_rec = StandardScaler().fit_transform(features_rec)
-scaled_df = pd.DataFrame(scaled_rec, index=df.index)
+@st.cache_resource
+def build_recommender(data):
+    features = data[['danceability','energy','valence','tempo','acousticness']]
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(features)
+    return pd.DataFrame(scaled, index=data.index)
+
+scaled_df = build_recommender(df)
 
 def recommend_songs(song_name, top_n=5):
     match = df[df['name'].str.lower() == song_name.lower()]
@@ -96,12 +107,7 @@ def recommend_songs(song_name, top_n=5):
 # FUZZY SEARCH
 # -------------------------------
 def fuzzy_search(query, choices, limit=5):
-    results = process.extract(
-        query,
-        choices,
-        scorer=fuzz.token_sort_ratio,
-        limit=limit
-    )
+    results = process.extract(query, choices, scorer=fuzz.token_sort_ratio, limit=limit)
     return [r[0] for r in results if r[1] > 60]
 
 # -------------------------------
@@ -119,7 +125,7 @@ def recommend_for_user(user_vector, top_n=5):
     return df[['name','artists','engagement_level']].iloc[indices]
 
 # -------------------------------
-# SIDEBAR
+# SIDEBAR FILTERS
 # -------------------------------
 st.sidebar.header("Filters")
 
@@ -131,8 +137,8 @@ levels = st.sidebar.multiselect(
 
 cluster_filter = st.sidebar.multiselect(
     "Cluster",
-    df['cluster_label'].unique(),
-    default=df['cluster_label'].unique()
+    df['cluster_label'].dropna().unique(),
+    default=df['cluster_label'].dropna().unique()
 )
 
 filtered_df = df[
@@ -140,38 +146,50 @@ filtered_df = df[
     df['cluster_label'].isin(cluster_filter)
 ]
 
+if filtered_df.empty:
+    st.warning("No data after filters")
+    st.stop()
+
 # -------------------------------
 # KPIs
 # -------------------------------
 st.subheader("📊 KPIs")
 
 c1,c2,c3 = st.columns(3)
-c1.metric("Tracks", len(filtered_df))
+c1.metric("Tracks", f"{len(filtered_df):,}")
 c2.metric("Avg Engagement", round(filtered_df['engagement_score'].mean(),2))
 c3.metric("Avg Popularity", round(filtered_df['popularity'].mean(),2))
 
 # -------------------------------
-# VISUALS
+# VISUALS (COLORBLIND SAFE)
 # -------------------------------
 st.subheader("📈 Insights")
 
 col1,col2 = st.columns(2)
 
 with col1:
-    st.plotly_chart(px.histogram(filtered_df, x="engagement_score", color="engagement_level"), use_container_width=True)
+    fig1 = px.histogram(filtered_df, x="engagement_score", color="engagement_level",
+                        color_discrete_sequence=px.colors.qualitative.Safe)
+    st.plotly_chart(fig1, use_container_width=True)
 
 with col2:
-    st.plotly_chart(px.scatter(filtered_df, x="energy", y="popularity", color="engagement_level"), use_container_width=True)
+    fig2 = px.scatter(filtered_df, x="energy", y="popularity", color="engagement_level",
+                      color_discrete_sequence=px.colors.qualitative.Safe)
+    st.plotly_chart(fig2, use_container_width=True)
 
 # -------------------------------
 # CLUSTER VIEW
 # -------------------------------
 st.subheader("🎯 Cluster Analysis")
 
-st.plotly_chart(
-    px.scatter(filtered_df, x="danceability", y="energy", color="cluster_label"),
-    use_container_width=True
+fig_cluster = px.scatter(
+    filtered_df,
+    x="danceability",
+    y="energy",
+    color="cluster_label",
+    color_discrete_sequence=px.colors.qualitative.Safe
 )
+st.plotly_chart(fig_cluster, use_container_width=True)
 
 # -------------------------------
 # A/B TEST
@@ -188,11 +206,11 @@ st.write(f"Lift: {lift:.2f}%")
 st.write(f"P-value: {p:.5f}")
 
 # -------------------------------
-# FUZZY SEARCH UI
+# SMART SEARCH
 # -------------------------------
 st.subheader("🎧 Smart Song Search")
 
-search_query = st.text_input("Type song name (supports typos)")
+search_query = st.text_input("Type song name")
 
 if search_query:
     matches = fuzzy_search(search_query, df['name'].dropna().unique())
@@ -209,21 +227,13 @@ else:
 # RECOMMENDATIONS
 # -------------------------------
 if selected_song:
-    st.markdown(f"### 🎵 Selected: {selected_song}")
+    st.markdown(f"### 🎵 {selected_song}")
 
     results = recommend_songs(selected_song)
 
     if results is not None:
-        cols = st.columns(2)
-        for i, (_, row) in enumerate(results.iterrows()):
-            with cols[i % 2]:
-                st.markdown(f"""
-                <div style="background-color:rgba(255,255,255,0.08);padding:12px;border-radius:10px;">
-                <b>{row['name']}</b><br>
-                👤 {row['artists']}<br>
-                🎯 {row['engagement_level']}
-                </div>
-                """, unsafe_allow_html=True)
+        for _, row in results.iterrows():
+            st.markdown(f"**{row['name']}** — {row['artists']} ({row['engagement_level']})")
 
 # -------------------------------
 # PERSONALIZATION
